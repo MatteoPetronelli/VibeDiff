@@ -24,6 +24,7 @@ colored = "2.1"
 crossterm = "0.27"
 notify = "6.1"
 tokio-util = "0.7"
+ahash = "0.8"
 
 [[bin]]
 name = "vd"

@@ -1,5 +1,7 @@
 use crate::git::{ChangedFile, SupportedLanguage};
+use ahash::AHashMap;
 use anyhow::{anyhow, Context, Result};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,9 +114,17 @@ pub fn get_language(language: SupportedLanguage) -> Option<tree_sitter::Language
 
 struct ExtractedNode {
     symbol_name: String,
-    signature_tokens: Vec<String>,
-    all_tokens: Vec<String>,
+    sig_hash: u64,
+    body_hash: u64,
     clean_text: String,
+}
+
+fn hash_tokens(tokens: &[String], state: &ahash::RandomState) -> u64 {
+    let mut hasher = state.build_hasher();
+    for token in tokens {
+        token.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn is_comment_node(kind: &str) -> bool {
@@ -122,6 +132,10 @@ fn is_comment_node(kind: &str) -> bool {
         || kind == "line_comment"
         || kind == "block_comment"
         || kind.contains("comment")
+}
+
+fn is_error_node(kind: &str) -> bool {
+    kind == "ERROR" || kind == "error"
 }
 
 fn is_leaf_functional_node(kind: &str) -> bool {
@@ -134,6 +148,20 @@ fn is_leaf_functional_node(kind: &str) -> bool {
             | "method_definition"
             | "local_function_statement"
             | "constructor_declaration"
+            | "async_function_definition"
+            | "decorated_definition"
+            | "enum_variant"
+            | "macro_invocation"
+            | "type_item"
+            | "associated_type"
+            | "enum_member_declaration"
+            | "property_declaration"
+            | "indexer_declaration"
+            | "delegate_declaration"
+            | "type_alias_declaration"
+            | "type_definition"
+            | "alias_declaration"
+            | "type_spec"
     )
 }
 
@@ -144,16 +172,22 @@ fn is_functional_node(kind: &str) -> bool {
             "struct_item"
                 | "enum_item"
                 | "trait_item"
+                | "impl_item"
                 | "class_declaration"
                 | "struct_declaration"
                 | "interface_declaration"
                 | "enum_declaration"
-                | "type_alias_declaration"
                 | "class_specifier"
                 | "struct_specifier"
+                | "enum_specifier"
+                | "namespace_definition"
+                | "class_definition"
+                | "export_statement"
+                | "type_declaration"
                 | "match_expression"
                 | "match_statement"
                 | "switch_statement"
+                | "switch_expression"
         )
 }
 
@@ -199,6 +233,49 @@ fn extract_declarator_identifier(node: tree_sitter::Node, source: &[u8]) -> Opti
 }
 
 fn get_symbol_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    if node.kind() == "decorated_definition" {
+        if let Some(def) = node.child_by_field_name("definition") {
+            if let Some(name) = get_symbol_name(def, source) {
+                return Some(name);
+            }
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if matches!(
+                    child.kind(),
+                    "function_definition" | "async_function_definition" | "class_definition"
+                ) {
+                    if let Some(name) = get_symbol_name(child, source) {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+    }
+
+    if node.kind() == "export_statement" {
+        if let Some(decl) = node.child_by_field_name("declaration") {
+            if let Some(name) = get_symbol_name(decl, source) {
+                return Some(name);
+            }
+        }
+    }
+
+    if node.kind() == "macro_invocation" {
+        if let Some(macro_node) = node.child_by_field_name("macro") {
+            if let Ok(name) = std::str::from_utf8(&source[macro_node.byte_range()]) {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    if node.kind() == "indexer_declaration" {
+        return Some("this[]".to_string());
+    }
+
     if let Some(name_node) = node.child_by_field_name("name") {
         if let Ok(name) = std::str::from_utf8(&source[name_node.byte_range()]) {
             let trimmed = name.trim();
@@ -222,7 +299,12 @@ fn get_symbol_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
             ) {
                 if let Ok(text) = std::str::from_utf8(&source[child.byte_range()]) {
                     let trimmed = text.trim();
-                    if !trimmed.is_empty() {
+                    if !trimmed.is_empty()
+                        && trimmed != "fn"
+                        && trimmed != "def"
+                        && trimmed != "function"
+                        && trimmed != "pub"
+                    {
                         return Some(trimmed.to_string());
                     }
                 }
@@ -264,7 +346,7 @@ fn collect_tokens(
     body_range: Option<(usize, usize)>,
     tokens: &mut Vec<String>,
 ) {
-    if is_comment_node(node.kind()) {
+    if is_comment_node(node.kind()) || node.is_missing() {
         return;
     }
 
@@ -291,6 +373,44 @@ fn collect_tokens(
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             collect_tokens(child, source, is_sig_only, body_range, tokens);
+        }
+    }
+}
+
+fn collect_body_tokens(
+    node: tree_sitter::Node,
+    source: &[u8],
+    body_range: Option<(usize, usize)>,
+    tokens: &mut Vec<String>,
+) {
+    let (b_start, b_end) = match body_range {
+        Some(range) => range,
+        None => return,
+    };
+
+    if is_comment_node(node.kind()) || node.is_missing() {
+        return;
+    }
+
+    if node.end_byte() <= b_start || node.start_byte() >= b_end {
+        return;
+    }
+
+    if node.child_count() == 0 {
+        if !node.byte_range().is_empty() {
+            if let Ok(text) = std::str::from_utf8(&source[node.byte_range()]) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed.to_string());
+                }
+            }
+        }
+        return;
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_body_tokens(child, source, body_range, tokens);
         }
     }
 }
@@ -345,11 +465,94 @@ fn clean_node_text(node: tree_sitter::Node, source: &[u8]) -> String {
     cleaned_lines.join("\n").trim().to_string()
 }
 
+fn try_recover_function_from_error(
+    error_node: tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, Option<(usize, usize)>)> {
+    let mut func_name: Option<String> = None;
+    let mut has_params = false;
+    let mut body_start: Option<usize> = None;
+
+    for i in 0..error_node.child_count() {
+        if let Some(child) = error_node.child(i) {
+            let k = child.kind();
+            if (k == "identifier" || k == "type_identifier") && func_name.is_none() {
+                if let Ok(text) = std::str::from_utf8(&source[child.byte_range()]) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty()
+                        && trimmed != "fn"
+                        && trimmed != "def"
+                        && trimmed != "function"
+                        && trimmed != "pub"
+                    {
+                        func_name = Some(trimmed.to_string());
+                    }
+                }
+            } else if k.contains("parameter") || k.contains("argument") {
+                has_params = true;
+            } else if k == "{" || k == "block" || k == "statement_block" || k == "compound_statement" {
+                body_start = Some(child.start_byte());
+            }
+        }
+    }
+
+    if body_start.is_none() {
+        let node_bytes = &source[error_node.start_byte()..error_node.end_byte()];
+        if let Some(pos) = node_bytes.iter().position(|&b| b == b'{') {
+            body_start = Some(error_node.start_byte() + pos);
+        }
+    }
+
+    if let Some(name) = func_name {
+        if has_params || body_start.is_some() {
+            let body_range = body_start.map(|s| (s, error_node.end_byte()));
+            return Some((name, body_range));
+        }
+    }
+
+    None
+}
+
 fn extract_nodes(
     cursor_node: tree_sitter::Node,
     source: &[u8],
     result: &mut Vec<ExtractedNode>,
+    hasher_state: &ahash::RandomState,
 ) {
+    if cursor_node.is_missing() {
+        return;
+    }
+
+    if is_error_node(cursor_node.kind()) {
+        let mut has_child_functional = false;
+        for i in 0..cursor_node.child_count() {
+            if let Some(child) = cursor_node.child(i) {
+                if contains_leaf_functional(child) || is_functional_node(child.kind()) {
+                    has_child_functional = true;
+                    extract_nodes(child, source, result, hasher_state);
+                }
+            }
+        }
+        if !has_child_functional {
+            if let Some((name, body_range)) = try_recover_function_from_error(cursor_node, source) {
+                let mut sig_tokens = Vec::new();
+                collect_tokens(cursor_node, source, true, body_range, &mut sig_tokens);
+                let mut body_tokens = Vec::new();
+                collect_body_tokens(cursor_node, source, body_range, &mut body_tokens);
+                let clean_text = clean_node_text(cursor_node, source);
+                let sig_hash = hash_tokens(&sig_tokens, hasher_state);
+                let body_hash = hash_tokens(&body_tokens, hasher_state);
+                result.push(ExtractedNode {
+                    symbol_name: name,
+                    sig_hash,
+                    body_hash,
+                    clean_text,
+                });
+            }
+        }
+        return;
+    }
+
     if is_functional_node(cursor_node.kind()) {
         if let Some(symbol_name) = get_symbol_name(cursor_node, source) {
             let mut has_child_functional = false;
@@ -365,13 +568,15 @@ fn extract_nodes(
                 let body_range = get_body_range(cursor_node);
                 let mut sig_tokens = Vec::new();
                 collect_tokens(cursor_node, source, true, body_range, &mut sig_tokens);
-                let mut all_tokens = Vec::new();
-                collect_tokens(cursor_node, source, false, None, &mut all_tokens);
+                let mut body_tokens = Vec::new();
+                collect_body_tokens(cursor_node, source, body_range, &mut body_tokens);
                 let clean_text = clean_node_text(cursor_node, source);
+                let sig_hash = hash_tokens(&sig_tokens, hasher_state);
+                let body_hash = hash_tokens(&body_tokens, hasher_state);
                 result.push(ExtractedNode {
                     symbol_name,
-                    signature_tokens: sig_tokens,
-                    all_tokens,
+                    sig_hash,
+                    body_hash,
                     clean_text,
                 });
                 return;
@@ -381,7 +586,7 @@ fn extract_nodes(
 
     for i in 0..cursor_node.child_count() {
         if let Some(child) = cursor_node.child(i) {
-            extract_nodes(child, source, result);
+            extract_nodes(child, source, result, hasher_state);
         }
     }
 }
@@ -419,73 +624,101 @@ pub fn diff_source(
         )
     };
 
+    let hasher_state = ahash::RandomState::with_seeds(0x243f, 0x6a88, 0x85a3, 0x08d3);
+
     let mut old_nodes = Vec::new();
     if let Some(tree) = &old_tree {
-        extract_nodes(tree.root_node(), old_content.as_bytes(), &mut old_nodes);
+        extract_nodes(
+            tree.root_node(),
+            old_content.as_bytes(),
+            &mut old_nodes,
+            &hasher_state,
+        );
     }
 
     let mut new_nodes = Vec::new();
     if let Some(tree) = &new_tree {
-        extract_nodes(tree.root_node(), new_content.as_bytes(), &mut new_nodes);
+        extract_nodes(
+            tree.root_node(),
+            new_content.as_bytes(),
+            &mut new_nodes,
+            &hasher_state,
+        );
     }
 
-    let mut matched_new = vec![false; new_nodes.len()];
-    let mut hunks = Vec::new();
+    let mut old_map: AHashMap<String, Vec<ExtractedNode>> = AHashMap::new();
+    for node in old_nodes {
+        old_map.entry(node.symbol_name.clone()).or_default().push(node);
+    }
 
-    for old_node in &old_nodes {
-        let mut found_idx = None;
-        for (idx, new_node) in new_nodes.iter().enumerate() {
-            if !matched_new[idx]
-                && new_node.symbol_name == old_node.symbol_name
-                && new_node.signature_tokens == old_node.signature_tokens
-            {
-                found_idx = Some(idx);
-                break;
-            }
-        }
-        if found_idx.is_none() {
-            for (idx, new_node) in new_nodes.iter().enumerate() {
-                if !matched_new[idx] && new_node.symbol_name == old_node.symbol_name {
-                    found_idx = Some(idx);
+    let mut hunks = Vec::new();
+    let mut unmatched_new = Vec::new();
+
+    for new_node in new_nodes {
+        if let Some(candidates) = old_map.get_mut(&new_node.symbol_name) {
+            let mut exact_idx = None;
+            for (idx, old) in candidates.iter().enumerate() {
+                if old.sig_hash == new_node.sig_hash && old.body_hash == new_node.body_hash {
+                    exact_idx = Some(idx);
                     break;
                 }
             }
-        }
-
-        if let Some(idx) = found_idx {
-            matched_new[idx] = true;
-            let new_node = &new_nodes[idx];
-            if old_node.all_tokens == new_node.all_tokens {
+            if let Some(idx) = exact_idx {
+                candidates.remove(idx);
                 continue;
             }
-            let kind = if old_node.signature_tokens != new_node.signature_tokens {
-                AstChangeKind::ContractBroken
-            } else {
-                AstChangeKind::Modified
-            };
-            hunks.push(AstHunk::new(
-                &old_node.symbol_name,
-                kind,
-                Some(old_node.clean_text.clone()),
-                Some(new_node.clean_text.clone()),
-            ));
+
+            let mut sig_match_idx = None;
+            for (idx, old) in candidates.iter().enumerate() {
+                if old.sig_hash == new_node.sig_hash {
+                    sig_match_idx = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = sig_match_idx {
+                let old = candidates.remove(idx);
+                hunks.push(AstHunk::new(
+                    &new_node.symbol_name,
+                    AstChangeKind::Modified,
+                    Some(old.clean_text),
+                    Some(new_node.clean_text),
+                ));
+                continue;
+            }
+
+            if !candidates.is_empty() {
+                let old = candidates.remove(0);
+                hunks.push(AstHunk::new(
+                    &new_node.symbol_name,
+                    AstChangeKind::ContractBroken,
+                    Some(old.clean_text),
+                    Some(new_node.clean_text),
+                ));
+                continue;
+            }
+
+            unmatched_new.push(new_node);
         } else {
-            hunks.push(AstHunk::new(
-                &old_node.symbol_name,
-                AstChangeKind::Deleted,
-                Some(old_node.clean_text.clone()),
-                None,
-            ));
+            unmatched_new.push(new_node);
         }
     }
 
-    for (idx, new_node) in new_nodes.iter().enumerate() {
-        if !matched_new[idx] {
+    for new_node in unmatched_new {
+        hunks.push(AstHunk::new(
+            &new_node.symbol_name,
+            AstChangeKind::Added,
+            None,
+            Some(new_node.clean_text),
+        ));
+    }
+
+    for (symbol_name, remaining_old) in old_map {
+        for old_node in remaining_old {
             hunks.push(AstHunk::new(
-                &new_node.symbol_name,
-                AstChangeKind::Added,
+                &symbol_name,
+                AstChangeKind::Deleted,
+                Some(old_node.clean_text),
                 None,
-                Some(new_node.clean_text.clone()),
             ));
         }
     }

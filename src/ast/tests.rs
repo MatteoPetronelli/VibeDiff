@@ -130,3 +130,102 @@ fn test_llm_payload_serialization() {
     assert!(payload.contains("<<< OLD"));
     assert!(payload.contains(">>> NEW"));
 }
+
+#[test]
+fn test_syntax_error_recovery_in_incomplete_buffers() {
+    let old_code = "fn compute(x: i32) -> i32 {\n    x * 2\n}\n";
+    let new_code = "fn compute(x: i32) -> i32 {\n    let val = \n}\n";
+
+    let diff = diff_source(
+        PathBuf::from("compute.rs"),
+        SupportedLanguage::Rust,
+        old_code,
+        new_code,
+    )
+    .expect("diff should succeed");
+
+    assert_eq!(diff.hunks.len(), 1);
+    let hunk = &diff.hunks[0];
+    assert_eq!(hunk.symbol_name, "compute");
+    assert_eq!(hunk.kind, AstChangeKind::Modified);
+    assert!(hunk.old_node.is_some());
+    assert!(hunk.new_node.is_some());
+
+    let unclosed_code = "fn compute(x: i32) -> i32 {\n    let val = 10;";
+    let unclosed_diff = diff_source(
+        PathBuf::from("compute.rs"),
+        SupportedLanguage::Rust,
+        old_code,
+        unclosed_code,
+    )
+    .expect("diff should succeed");
+
+    assert_eq!(unclosed_diff.hunks.len(), 1);
+    let unclosed_hunk = &unclosed_diff.hunks[0];
+    assert_eq!(unclosed_hunk.symbol_name, "compute");
+    assert_eq!(unclosed_hunk.kind, AstChangeKind::Modified);
+}
+
+#[test]
+fn test_fine_grained_enum_variant_mutation() {
+    let old_code = "enum Status {\n    Pending,\n    Running,\n}\n";
+    let new_code = "enum Status {\n    Pending,\n    Running,\n    Completed,\n}\n";
+
+    let diff = diff_source(
+        PathBuf::from("status.rs"),
+        SupportedLanguage::Rust,
+        old_code,
+        new_code,
+    )
+    .expect("diff should succeed");
+
+    assert_eq!(diff.hunks.len(), 1);
+    let hunk = &diff.hunks[0];
+    assert_eq!(hunk.symbol_name, "Completed");
+    assert_eq!(hunk.kind, AstChangeKind::Added);
+    assert!(hunk.old_node.is_none());
+    assert!(hunk.new_node.is_some());
+    assert!(hunk.new_node.as_ref().unwrap().contains("Completed"));
+}
+
+#[test]
+fn test_associated_items_and_type_aliases() {
+    let old_code = "type Output = Result<String>;\n";
+    let new_code = "type Output = Result<Vec<u8>>;\n";
+
+    let diff = diff_source(
+        PathBuf::from("types.rs"),
+        SupportedLanguage::Rust,
+        old_code,
+        new_code,
+    )
+    .expect("diff should succeed");
+
+    assert_eq!(diff.hunks.len(), 1);
+    let hunk = &diff.hunks[0];
+    assert_eq!(hunk.symbol_name, "Output");
+    assert_eq!(hunk.kind, AstChangeKind::ContractBroken);
+    assert!(hunk.old_node.is_some());
+    assert!(hunk.new_node.is_some());
+}
+
+#[test]
+fn test_hash_indexed_performance_symmetry() {
+    let old_code = format!(
+        "fn alpha(x: i32) -> i32 {{\n    x + 1\n}}\n\nfn beta(y: String) -> usize {{\n    y.len()\n}}\n"
+    );
+    let new_code = format!(
+        "{} header comment\nfn alpha(\n    x: i32\n) -> i32 {{\n    {} inner comment\n    x + 1\n}}\n\n{} middle comment\nfn beta(y: String) -> usize {{\n    y.len()\n    {} trailing comment\n}}\n",
+        "\x2F\x2F", "\x2F\x2F", "\x2F\x2F", "\x2F\x2F"
+    );
+
+    let diff = diff_source(
+        PathBuf::from("symmetry.rs"),
+        SupportedLanguage::Rust,
+        &old_code,
+        &new_code,
+    )
+    .expect("diff should succeed");
+
+    assert!(diff.hunks.is_empty());
+}
