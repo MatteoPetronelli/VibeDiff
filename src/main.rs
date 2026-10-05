@@ -7,8 +7,8 @@ use std::path::Path;
 use tokio_util::sync::CancellationToken;
 use vibediff::{
     diff_conflict_file, discover_repository, extract_structural_diff, get_staged_files,
-    get_unstaged_files, parse_pillar_sections, partition_diffs_by_budget,
-    serialize_chunk_payload, GitDiffExtractor, OllamaClient, PillarAnalysisReport,
+    get_unstaged_files, parse_pillar_sections, partition_diffs_by_budget, run_tui,
+    serialize_chunk_payload, App, GitDiffExtractor, OllamaClient, PillarAnalysisReport,
     TokenBudgeter, VibeDiffJsonReport, CONFLICT_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
@@ -26,6 +26,9 @@ pub struct Cli {
 
     #[arg(short, long)]
     pub watch: bool,
+
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
 
     #[arg(long)]
     pub json: bool,
@@ -402,10 +405,60 @@ pub async fn run_watch(args: &Cli) -> Result<()> {
     Ok(())
 }
 
+pub async fn run_interactive(args: &Cli) -> Result<()> {
+    let (repo_path, structural_diffs, staged_status) = {
+        let repo = discover_repository().context("Failed to discover Git repository")?;
+        let repo_path = repo.path().to_path_buf();
+        let extractor = GitDiffExtractor::new(&repo);
+        let is_conflict = extractor.has_conflicts().unwrap_or(false);
+
+        let (diffs, staged_status) = if is_conflict {
+            let conflict_files = extractor.get_conflict_changes()?;
+            let mut diffs = Vec::new();
+            for file in &conflict_files {
+                let diff = diff_conflict_file(file);
+                if !diff.hunks.is_empty() {
+                    diffs.push(diff);
+                }
+            }
+            let count = diffs.len();
+            (diffs, vec![false; count])
+        } else {
+            let changed = if args.staged {
+                get_staged_files()?
+            } else {
+                get_unstaged_files()?
+            };
+            let mut diffs = Vec::new();
+            for file in &changed {
+                if let Ok(diff) = extract_structural_diff(file) {
+                    if !diff.hunks.is_empty() {
+                        diffs.push(diff);
+                    }
+                }
+            }
+            let index = repo.index()?;
+            let mut staged = Vec::with_capacity(diffs.len());
+            for diff in &diffs {
+                let posix = diff.file_path.to_string_lossy().replace('\\', "/");
+                let is_staged = index.get_path(Path::new(&posix), 0).is_some();
+                staged.push(is_staged);
+            }
+            (diffs, staged)
+        };
+        (repo_path, diffs, staged_status)
+    };
+
+    let app = App::new(structural_diffs, staged_status);
+    run_tui(app, &repo_path, &args.endpoint, &args.model).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
-    if args.watch {
+    if args.interactive {
+        run_interactive(&args).await
+    } else if args.watch {
         run_watch(&args).await
     } else {
         run_once(&args).await
@@ -421,6 +474,7 @@ mod tests {
         let args = Cli::parse_from(["vd"]);
         assert!(!args.staged);
         assert!(!args.watch);
+        assert!(!args.interactive);
         assert!(!args.json);
         assert_eq!(args.format, "text");
         assert_eq!(args.model, "bench-reason-4b");
@@ -434,6 +488,7 @@ mod tests {
             "vd",
             "--staged",
             "--watch",
+            "-i",
             "--json",
             "-m",
             "custom-model",
@@ -442,6 +497,7 @@ mod tests {
         ]);
         assert!(args.staged);
         assert!(args.watch);
+        assert!(args.interactive);
         assert!(args.json);
         assert!(args.is_json());
         assert_eq!(args.model, "custom-model");
@@ -450,6 +506,14 @@ mod tests {
         let args_format = Cli::parse_from(["vd", "--format", "json"]);
         assert_eq!(args_format.format, "json");
         assert!(args_format.is_json());
+    }
+
+    #[test]
+    fn test_cli_interactive_flags() {
+        let args_short = Cli::parse_from(["vd", "-i"]);
+        assert!(args_short.interactive);
+        let args_long = Cli::parse_from(["vd", "--interactive"]);
+        assert!(args_long.interactive);
     }
 
     #[test]

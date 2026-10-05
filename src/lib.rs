@@ -3,6 +3,7 @@ pub mod budget;
 pub mod client;
 pub mod git;
 pub mod output;
+pub mod tui;
 
 pub use ast::{
     diff_changed_file, diff_conflict_file, diff_files, diff_source, extract_structural_diff,
@@ -27,3 +28,4 @@ pub use output::{
     VibeDiffJsonReport,
 };
 pub use tokio_util::sync::CancellationToken;
+pub use tui::{run_tui, ActivePane, App};
