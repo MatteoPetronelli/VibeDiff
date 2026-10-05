@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod budget;
 pub mod client;
 pub mod git;
 pub mod output;
@@ -6,6 +7,10 @@ pub mod output;
 pub use ast::{
     diff_changed_file, diff_files, diff_source, extract_structural_diff, get_language,
     AstChangeKind, AstHunk, StructuralDiff,
+};
+pub use budget::{
+    estimate_code_tokens, partition_diffs_by_budget, serialize_chunk_payload,
+    truncate_monster_node, TokenBudgeter,
 };
 pub use client::{
     parse_sse_line, parse_sse_text, ChatCompletionChunk, ChatCompletionRequest, ChatMessage,

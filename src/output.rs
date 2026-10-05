@@ -47,6 +47,44 @@ pub struct PillarAnalysisReport {
     pub raw_output: String,
 }
 
+impl PillarAnalysisReport {
+    pub fn merge(&mut self, other: &PillarAnalysisReport) {
+        if self.model.is_empty() {
+            self.model = other.model.clone();
+        }
+        if !other.data_journey.is_empty() {
+            if !self.data_journey.is_empty() {
+                self.data_journey.push_str("\n\n");
+            }
+            self.data_journey.push_str(&other.data_journey);
+        }
+        if !other.architectural_patterns.is_empty() {
+            if !self.architectural_patterns.is_empty() {
+                self.architectural_patterns.push_str("\n\n");
+            }
+            self.architectural_patterns.push_str(&other.architectural_patterns);
+        }
+        if !other.language_caveats.is_empty() {
+            if !self.language_caveats.is_empty() {
+                self.language_caveats.push_str("\n\n");
+            }
+            self.language_caveats.push_str(&other.language_caveats);
+        }
+        if !other.critical_anchors.is_empty() {
+            if !self.critical_anchors.is_empty() {
+                self.critical_anchors.push_str("\n\n");
+            }
+            self.critical_anchors.push_str(&other.critical_anchors);
+        }
+        if !other.raw_output.is_empty() {
+            if !self.raw_output.is_empty() {
+                self.raw_output.push_str("\n\n---\n\n");
+            }
+            self.raw_output.push_str(&other.raw_output);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VibeDiffJsonReport {
     pub version: String,
@@ -298,5 +336,34 @@ Watch loop may drop events if channel is full.
         assert!(json.contains("\"total_hunks\": 0"));
         assert!(json.contains("\"diffs\": []"));
         assert!(json.contains("\"files_evaluated\": 0"));
+    }
+
+    #[test]
+    fn test_pillar_analysis_report_merge() {
+        let mut report1 = PillarAnalysisReport {
+            model: "bench-reason-4b".to_string(),
+            data_journey: "Journey 1".to_string(),
+            architectural_patterns: "Pattern 1".to_string(),
+            language_caveats: "Caveat 1".to_string(),
+            critical_anchors: "Anchor 1".to_string(),
+            raw_output: "Raw 1".to_string(),
+        };
+
+        let report2 = PillarAnalysisReport {
+            model: "bench-reason-4b".to_string(),
+            data_journey: "Journey 2".to_string(),
+            architectural_patterns: "Pattern 2".to_string(),
+            language_caveats: "Caveat 2".to_string(),
+            critical_anchors: "Anchor 2".to_string(),
+            raw_output: "Raw 2".to_string(),
+        };
+
+        report1.merge(&report2);
+
+        assert_eq!(report1.data_journey, "Journey 1\n\nJourney 2");
+        assert_eq!(report1.architectural_patterns, "Pattern 1\n\nPattern 2");
+        assert_eq!(report1.language_caveats, "Caveat 1\n\nCaveat 2");
+        assert_eq!(report1.critical_anchors, "Anchor 1\n\nAnchor 2");
+        assert_eq!(report1.raw_output, "Raw 1\n\n---\n\nRaw 2");
     }
 }

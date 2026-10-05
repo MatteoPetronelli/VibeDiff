@@ -6,7 +6,8 @@ use std::io::Write;
 use std::path::Path;
 use vibediff::{
     discover_repository, extract_structural_diff, get_staged_files, get_unstaged_files,
-    parse_pillar_sections, OllamaClient, VibeDiffJsonReport,
+    parse_pillar_sections, partition_diffs_by_budget, serialize_chunk_payload,
+    OllamaClient, PillarAnalysisReport, TokenBudgeter, VibeDiffJsonReport,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -108,77 +109,114 @@ pub async fn execute_pipeline(args: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    let mut full_payload = String::new();
+    let budgeter = TokenBudgeter::default_for_model(&args.model);
+    let chunks = partition_diffs_by_budget(&structural_diffs, &budgeter);
+    let total_chunks = chunks.len();
+
     if !args.is_json() {
         println!("{}", "=== VibeDiff Architectural Analysis ===".cyan().bold());
-    }
-
-    for diff in &structural_diffs {
-        if !args.is_json() {
-            let kinds: Vec<String> = diff
-                .hunks
-                .iter()
-                .map(|h| format!("{}: {}", h.symbol_name, h.kind))
-                .collect();
+        if total_chunks > 1 {
             println!(
-                "{} [{}] -> {}",
-                diff.file_path.display().to_string().green().bold(),
-                diff.language.to_string().magenta(),
-                kinds.join(", ").yellow()
+                "{}",
+                format!(
+                    "[!] Diff exceeds 4K context budget. Executing adaptive chunked analysis ({} passes)...",
+                    total_chunks
+                )
+                .yellow()
+                .bold()
             );
         }
-        full_payload.push_str(&diff.to_llm_payload());
-        full_payload.push('\n');
     }
 
-    if !args.is_json() {
-        println!("{}", "----------------------------------------".bright_black());
-    }
+    let mut merged_analysis = PillarAnalysisReport::default();
+    merged_analysis.model = args.model.clone();
 
-    let mut stdout = std::io::stdout();
-    let mut streamed_response = String::new();
-    let result = client
-        .analyze_stream(&full_payload, |chunk| {
-            if !args.is_json() {
-                print!("{}", chunk);
-                let _ = stdout.flush();
-            } else {
-                streamed_response.push_str(chunk);
-            }
-        })
-        .await;
-
-    match result {
-        Ok(raw_text) => {
-            let final_text = if args.is_json() {
-                streamed_response
-            } else {
-                raw_text
-            };
-            if args.is_json() {
-                let analysis = parse_pillar_sections(&final_text, &args.model);
-                let report = VibeDiffJsonReport::new(
-                    repo_root,
-                    mode,
-                    changed_files.len(),
-                    &structural_diffs,
-                    Some(analysis),
-                    start_time.elapsed().as_millis() as u64,
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if !args.is_json() {
+            if total_chunks > 1 {
+                let chunk_files: Vec<String> = chunk
+                    .iter()
+                    .map(|d| d.file_path.display().to_string())
+                    .collect();
+                println!(
+                    "{}",
+                    format!(
+                        "=== Chunk {}/{}: {} ===",
+                        idx + 1,
+                        total_chunks,
+                        chunk_files.join(", ")
+                    )
+                    .cyan()
+                    .bold()
                 );
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!();
-                println!("{}", "========================================".cyan().bold());
+            }
+            for diff in chunk {
+                let kinds: Vec<String> = diff
+                    .hunks
+                    .iter()
+                    .map(|h| format!("{}: {}", h.symbol_name, h.kind))
+                    .collect();
+                println!(
+                    "{} [{}] -> {}",
+                    diff.file_path.display().to_string().green().bold(),
+                    diff.language.to_string().magenta(),
+                    kinds.join(", ").yellow()
+                );
+            }
+            println!("{}", "----------------------------------------".bright_black());
+        }
+
+        let chunk_payload = serialize_chunk_payload(chunk, idx, total_chunks);
+        let mut stdout = std::io::stdout();
+        let mut chunk_streamed = String::new();
+
+        let result = client
+            .analyze_stream(&chunk_payload, |part| {
+                if !args.is_json() {
+                    print!("{}", part);
+                    let _ = stdout.flush();
+                } else {
+                    chunk_streamed.push_str(part);
+                }
+            })
+            .await;
+
+        match result {
+            Ok(raw_text) => {
+                let final_chunk_text = if args.is_json() {
+                    chunk_streamed
+                } else {
+                    raw_text
+                };
+                if args.is_json() {
+                    let chunk_report = parse_pillar_sections(&final_chunk_text, &args.model);
+                    merged_analysis.merge(&chunk_report);
+                } else {
+                    println!();
+                    println!("{}", "========================================".cyan().bold());
+                }
+            }
+            Err(e) => {
+                if args.is_json() {
+                    eprintln!("Inference error: {}", e);
+                } else {
+                    eprintln!("{}", format!("\nInference error: {}", e).red().bold());
+                }
+                return Err(e);
             }
         }
-        Err(e) => {
-            if args.is_json() {
-                eprintln!("Inference error: {}", e);
-            } else {
-                eprintln!("{}", format!("\nInference error: {}", e).red().bold());
-            }
-            return Err(e);
-        }
+    }
+
+    if args.is_json() {
+        let report = VibeDiffJsonReport::new(
+            repo_root,
+            mode,
+            changed_files.len(),
+            &structural_diffs,
+            Some(merged_analysis),
+            start_time.elapsed().as_millis() as u64,
+        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
     }
 
     Ok(())
