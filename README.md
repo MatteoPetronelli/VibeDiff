@@ -175,7 +175,7 @@ Extensive profiling comparing quantized 4B reasoning models against standard 7B 
 To build the benchmarked `bench-reason-4b` model locally:
 
 ```dockerfile
-FROM qwen2.5:3b
+FROM qwen3.5:4b
 
 PARAMETER temperature 0.2
 PARAMETER num_ctx 4096
@@ -230,7 +230,7 @@ Verify global availability:
 
 ```powershell
 vd --version
-# Output: vd 0.1.0
+# Output: vd 0.2.0
 
 vd --help
 ```
@@ -365,13 +365,15 @@ vd --staged --format json | jq '.diffs[] | select(.hunks[].kind == "CONTRACT_BRO
 ##### Output Schema Example (`VibeDiffJsonReport`)
 ```json
 {
-  "repo_root": "C:\\Users\\era92\\Desktop\\Matteo\\VibeDiff",
+  "version": "0.2.0",
+  "repository_root": "C:\\Users\\era92\\Desktop\\Matteo\\VibeDiff",
   "mode": "unstaged",
   "files_evaluated": 2,
+  "total_hunks": 1,
   "diffs": [
     {
-      "file_path": "src/ast/mod.rs",
-      "language": "Rust",
+      "path": "src/ast/mod.rs",
+      "language": "rust",
       "hunks": [
         {
           "symbol_name": "is_functional_node",
@@ -384,11 +386,11 @@ vd --staged --format json | jq '.diffs[] | select(.hunks[].kind == "CONTRACT_BRO
   ],
   "analysis": {
     "model": "bench-reason-4b",
-    "raw_text": "### 1. The Data Journey\n...",
-    "pillar_1_data_journey": "Step-by-step trace of how data enters...",
-    "pillar_2_pattern_intent": "Explicit identification of patterns applied...",
-    "pillar_3_framework_caveats": "Ecosystem hazards...",
-    "pillar_4_critical_anchors": "Bounds checks and edge cases..."
+    "data_journey": "Step-by-step trace of how data enters...",
+    "architectural_patterns": "Explicit identification of patterns applied...",
+    "language_caveats": "Ecosystem hazards...",
+    "critical_anchors": "Bounds checks and edge cases...",
+    "raw_output": "### 1. The Data Journey\n..."
   },
   "execution_time_ms": 1420
 }
@@ -439,14 +441,14 @@ VibeDiff includes an automated test suite verifying Git ingestion, Tree-Sitter n
 - **Remedy**:
   ```powershell
   # Pull base model or create candidate
-  ollama pull qwen2.5:3b
+  ollama pull qwen3.5:4b
   ollama create bench-reason-4b -f Modelfile
   ```
 
 ### 3. VRAM Allocation Spillover / Generation Stalls
 - **Symptom**: Token generation speed drops below 5 tokens/sec; high shared GPU memory usage in Task Manager.
 - **Root Cause**: Model size exceeds available physical VRAM (6 GB), forcing weights into system RAM over the PCIe bus.
-- **Remedy**: Switch to a quantized 4B or 3B parameter model (`qwen2.5:3b` or `bench-reason-4b`) and ensure the context window is capped at 4096 tokens (`PARAMETER num_ctx 4096`).
+- **Remedy**: Switch to a quantized 4B parameter model (`qwen3.5:4b` or `bench-reason-4b`) and ensure the context window is capped at 4096 tokens (`PARAMETER num_ctx 4096`).
 
 ### 4. Git Repository Discovery Failure
 - **Symptom**: `Failed to discover Git repository: could not find repository from '.'`
