@@ -3,8 +3,8 @@ pub mod client;
 pub mod git;
 
 pub use ast::{
-    diff_changed_file, diff_files, diff_source, get_language, AstChangeKind, AstHunk,
-    StructuralDiff,
+    diff_changed_file, diff_files, diff_source, extract_structural_diff, get_language,
+    AstChangeKind, AstHunk, StructuralDiff,
 };
 pub use client::{
     parse_sse_line, parse_sse_text, ChatCompletionChunk, ChatCompletionRequest, ChatMessage,
@@ -12,5 +12,6 @@ pub use client::{
 };
 pub use git::{
     discover_repository, discover_repository_at, get_changed_files, get_changed_files_at,
-    get_changed_files_from_repo, is_ignored_lockfile, ChangedFile, SupportedLanguage,
+    get_changed_files_from_repo, get_changed_files_selective, get_staged_files,
+    get_unstaged_files, is_ignored_lockfile, ChangedFile, SupportedLanguage,
 };

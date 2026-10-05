@@ -502,6 +502,10 @@ pub fn diff_changed_file(file: &ChangedFile) -> Result<StructuralDiff> {
     )
 }
 
+pub fn extract_structural_diff(file: &ChangedFile) -> Result<StructuralDiff> {
+    diff_changed_file(file)
+}
+
 pub fn diff_files(files: &[ChangedFile]) -> Result<Vec<StructuralDiff>> {
     let mut diffs = Vec::with_capacity(files.len());
     for file in files {

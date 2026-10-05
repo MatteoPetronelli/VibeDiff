@@ -109,7 +109,24 @@ pub fn get_changed_files_at<P: AsRef<Path>>(path: P) -> Result<Vec<ChangedFile>>
     get_changed_files_from_repo(&repo)
 }
 
+pub fn get_staged_files() -> Result<Vec<ChangedFile>> {
+    let repo = discover_repository()?;
+    get_changed_files_selective(&repo, Some(true))
+}
+
+pub fn get_unstaged_files() -> Result<Vec<ChangedFile>> {
+    let repo = discover_repository()?;
+    get_changed_files_selective(&repo, Some(false))
+}
+
 pub fn get_changed_files_from_repo(repo: &Repository) -> Result<Vec<ChangedFile>> {
+    get_changed_files_selective(repo, None)
+}
+
+pub fn get_changed_files_selective(
+    repo: &Repository,
+    staged_filter: Option<bool>,
+) -> Result<Vec<ChangedFile>> {
     let workdir = repo
         .workdir()
         .context("Repository does not have a working directory")?;
@@ -141,6 +158,30 @@ pub fn get_changed_files_from_repo(repo: &Repository) -> Result<Vec<ChangedFile>
             continue;
         }
 
+        if let Some(true) = staged_filter {
+            let is_staged = status.intersects(
+                git2::Status::INDEX_NEW
+                    | git2::Status::INDEX_MODIFIED
+                    | git2::Status::INDEX_RENAMED
+                    | git2::Status::INDEX_TYPECHANGE,
+            );
+            if !is_staged {
+                continue;
+            }
+        }
+
+        if let Some(false) = staged_filter {
+            let is_unstaged = status.intersects(
+                git2::Status::WT_NEW
+                    | git2::Status::WT_MODIFIED
+                    | git2::Status::WT_RENAMED
+                    | git2::Status::WT_TYPECHANGE,
+            );
+            if !is_unstaged {
+                continue;
+            }
+        }
+
         if status.contains(git2::Status::WT_DELETED) || status.contains(git2::Status::INDEX_DELETED) {
             if !status.intersects(
                 git2::Status::WT_NEW
@@ -169,27 +210,63 @@ pub fn get_changed_files_from_repo(repo: &Repository) -> Result<Vec<ChangedFile>
         };
 
         let full_path = workdir.join(&rel_path);
-        if !full_path.is_file() {
-            continue;
-        }
+        let posix_path = path_str.replace('\\', "/");
 
-        let new_bytes = match std::fs::read(&full_path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Err(anyhow!(e).context(format!(
-                    "Failed to read working directory file: {:?}",
-                    full_path
-                )));
+        let new_content = if let Some(true) = staged_filter {
+            if let Ok(index) = repo.index() {
+                if let Some(entry) = index.get_path(Path::new(&posix_path), 0) {
+                    if let Ok(blob) = repo.find_blob(entry.id) {
+                        if blob.content().contains(&0) {
+                            continue;
+                        }
+                        String::from_utf8_lossy(blob.content()).to_string()
+                    } else if full_path.is_file() {
+                        let bytes = std::fs::read(&full_path).map_err(|e| anyhow!(e))?;
+                        if bytes.contains(&0) {
+                            continue;
+                        }
+                        String::from_utf8(bytes).map_err(|e| anyhow!(e))?
+                    } else {
+                        continue;
+                    }
+                } else if full_path.is_file() {
+                    let bytes = std::fs::read(&full_path).map_err(|e| anyhow!(e))?;
+                    if bytes.contains(&0) {
+                        continue;
+                    }
+                    String::from_utf8(bytes).map_err(|e| anyhow!(e))?
+                } else {
+                    continue;
+                }
+            } else if full_path.is_file() {
+                let bytes = std::fs::read(&full_path).map_err(|e| anyhow!(e))?;
+                if bytes.contains(&0) {
+                    continue;
+                }
+                String::from_utf8(bytes).map_err(|e| anyhow!(e))?
+            } else {
+                continue;
             }
-        };
-
-        if new_bytes.contains(&0) {
-            continue;
-        }
-
-        let new_content = match String::from_utf8(new_bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
+        } else {
+            if !full_path.is_file() {
+                continue;
+            }
+            let new_bytes = match std::fs::read(&full_path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(anyhow!(e).context(format!(
+                        "Failed to read working directory file: {:?}",
+                        full_path
+                    )));
+                }
+            };
+            if new_bytes.contains(&0) {
+                continue;
+            }
+            match String::from_utf8(new_bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
         };
 
         let old_content = match &head_tree {
@@ -198,11 +275,11 @@ pub fn get_changed_files_from_repo(repo: &Repository) -> Result<Vec<ChangedFile>
                     .head_to_index()
                     .and_then(|diff| diff.old_file().path().and_then(|p| p.to_str()))
                     .unwrap_or(path_str);
-                let posix_path = lookup_path.replace('\\', "/");
-                match tree.get_path(Path::new(&posix_path)) {
+                let posix_lookup = lookup_path.replace('\\', "/");
+                match tree.get_path(Path::new(&posix_lookup)) {
                     Ok(tree_entry) => {
                         let object = tree_entry.to_object(repo).with_context(|| {
-                            format!("Failed to retrieve tree object for {:?}", posix_path)
+                            format!("Failed to retrieve tree object for {:?}", posix_lookup)
                         })?;
                         if let Some(blob) = object.as_blob() {
                             if blob.content().contains(&0) {
