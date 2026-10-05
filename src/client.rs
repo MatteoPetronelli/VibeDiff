@@ -6,6 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 pub const SYSTEM_PROMPT: &str = "You are an expert systems engineer and software architect analyzing code diffs.\nProduce an architectural analysis strictly adhering to the following 4-Pillar schema:\n\n1. THE DATA JOURNEY: Step-by-step trace of how data enters, mutates, and exits the changed subsystem.\n2. ARCHITECTURAL PATTERN & DESIGN INTENT: Explicit identification of patterns applied (Event Bus, State Machine, ECS, Guard Clause, etc.).\n3. LANGUAGE & FRAMEWORK CAVEATS: Ecosystem hazards (Unity C# GC/hot-paths, Unreal C++ UPROPERTY ownership, Rust borrow bounds, Python GIL).\n4. CRITICAL ANCHORS & UNHANDLED EDGE CASES: Bounds errors, unhandled exceptions, dropped guard clauses, or silent failures.";
 
+pub const CONFLICT_SYSTEM_PROMPT: &str = "You are an expert systems engineer and software architect reconciling git merge/rebase conflicts.\nAnalyze the conflicting changes adhering to the following 4-Pillar schema:\n\n1. THE CONVERGENT DATA JOURNEY: How Ours vs. Theirs diverge on data state, control flow, and mutation lifecycles.\n2. PATTERN DISPUTE: Explicitly evaluate design paradigms in conflict (Sync vs. Async, In-Place vs. Immutable, Event-Driven vs. Polling).\n3. FRAMEWORK CAVEATS: Ecosystem hazards and target idioms violated by either branch (GC churn, thread safety, lifetimes, borrow bounds).\n4. RECOMMENDED RESOLUTION: A definitive, concrete architectural recommendation to safely merge both intents without semantic regressions.";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -124,10 +126,18 @@ impl OllamaClient {
     }
 
     pub fn build_request(&self, user_content: &str) -> ChatCompletionRequest {
+        self.build_request_with_system(user_content, SYSTEM_PROMPT)
+    }
+
+    pub fn build_request_with_system(
+        &self,
+        user_content: &str,
+        system_prompt: &str,
+    ) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: self.model.clone(),
             messages: vec![
-                ChatMessage::system(SYSTEM_PROMPT),
+                ChatMessage::system(system_prompt),
                 ChatMessage::user(user_content),
             ],
             temperature: self.temperature,
@@ -189,8 +199,28 @@ impl OllamaClient {
     where
         F: FnMut(&str),
     {
-        self.analyze_stream_cancellable_with_timeout(
+        self.analyze_stream_cancellable_with_system(
             payload,
+            SYSTEM_PROMPT,
+            cancel_token,
+            on_chunk,
+        )
+        .await
+    }
+
+    pub async fn analyze_stream_cancellable_with_system<F>(
+        &self,
+        payload: &str,
+        system_prompt: &str,
+        cancel_token: CancellationToken,
+        on_chunk: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.analyze_stream_cancellable_with_timeout_system(
+            payload,
+            system_prompt,
             cancel_token,
             Duration::from_secs(15),
             on_chunk,
@@ -203,13 +233,34 @@ impl OllamaClient {
         payload: &str,
         cancel_token: CancellationToken,
         chunk_timeout: Duration,
+        on_chunk: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.analyze_stream_cancellable_with_timeout_system(
+            payload,
+            SYSTEM_PROMPT,
+            cancel_token,
+            chunk_timeout,
+            on_chunk,
+        )
+        .await
+    }
+
+    pub async fn analyze_stream_cancellable_with_timeout_system<F>(
+        &self,
+        payload: &str,
+        system_prompt: &str,
+        cancel_token: CancellationToken,
+        chunk_timeout: Duration,
         mut on_chunk: F,
     ) -> Result<String>
     where
         F: FnMut(&str),
     {
         let url = format!("{}/v1/chat/completions", self.endpoint);
-        let request_body = self.build_request(payload);
+        let request_body = self.build_request_with_system(payload, system_prompt);
 
         let resp = tokio::select! {
             _ = cancel_token.cancelled() => {

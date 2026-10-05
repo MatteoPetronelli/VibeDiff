@@ -229,3 +229,43 @@ fn test_hash_indexed_performance_symmetry() {
 
     assert!(diff.hunks.is_empty());
 }
+
+#[test]
+fn test_diff_conflict_file_3way() {
+    let conflict_file = ConflictFile::new(
+        PathBuf::from("service.rs"),
+        SupportedLanguage::Rust,
+        Some("pub fn compute(x: i32) -> i32 { x * 2 }\n".to_string()),
+        Some("pub fn compute(x: i32) -> i32 { x * 10 }\n".to_string()),
+        Some("pub fn compute(x: i32) -> i32 { x * 20 }\n".to_string()),
+        String::new(),
+    );
+
+    let diff = diff_conflict_file(&conflict_file);
+    assert_eq!(diff.hunks.len(), 1);
+    let hunk = &diff.hunks[0];
+    assert_eq!(hunk.symbol_name, "compute");
+    assert_eq!(hunk.kind, AstChangeKind::ConflictContested);
+    assert!(hunk.old_node.as_ref().unwrap().contains("x * 10"));
+    assert!(hunk.new_node.as_ref().unwrap().contains("x * 20"));
+
+    let payload = diff.to_llm_payload();
+    assert!(payload.contains("[CONFLICT_CONTESTED] Symbol: compute"));
+    assert!(payload.contains("--- OURS (Current Branch):"));
+    assert!(payload.contains("--- THEIRS (Incoming Branch):"));
+
+    let marker_file = ConflictFile::new(
+        PathBuf::from("marker.rs"),
+        SupportedLanguage::Rust,
+        None,
+        None,
+        None,
+        "<<<<<<< HEAD\npub fn calculate() -> i32 { 1 }\n=======\npub fn calculate() -> i32 { 2 }\n>>>>>>> incoming\n".to_string(),
+    );
+
+    let marker_diff = diff_conflict_file(&marker_file);
+    assert_eq!(marker_diff.hunks.len(), 1);
+    let marker_hunk = &marker_diff.hunks[0];
+    assert_eq!(marker_hunk.symbol_name, "calculate");
+    assert_eq!(marker_hunk.kind, AstChangeKind::ConflictContested);
+}

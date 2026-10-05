@@ -6,9 +6,10 @@ use std::io::Write;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 use vibediff::{
-    discover_repository, extract_structural_diff, get_staged_files, get_unstaged_files,
-    parse_pillar_sections, partition_diffs_by_budget, serialize_chunk_payload,
-    OllamaClient, PillarAnalysisReport, TokenBudgeter, VibeDiffJsonReport,
+    diff_conflict_file, discover_repository, extract_structural_diff, get_staged_files,
+    get_unstaged_files, parse_pillar_sections, partition_diffs_by_budget,
+    serialize_chunk_payload, GitDiffExtractor, OllamaClient, PillarAnalysisReport,
+    TokenBudgeter, VibeDiffJsonReport, CONFLICT_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -41,7 +42,6 @@ impl Cli {
 
 pub async fn execute_pipeline(args: &Cli, cancel_token: CancellationToken) -> Result<()> {
     let start_time = std::time::Instant::now();
-    let mode = if args.staged { "staged" } else { "unstaged" };
 
     let client = OllamaClient::new(Some(args.endpoint.clone()), Some(args.model.clone()));
     if let Err(e) = client.check_health().await {
@@ -53,59 +53,76 @@ pub async fn execute_pipeline(args: &Cli, cancel_token: CancellationToken) -> Re
         return Err(e);
     }
 
-    let repo = discover_repository().context("Failed to discover Git repository")?;
-    let repo_root = repo
-        .workdir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| ".".to_string());
+    let (repo_root, is_conflict, conflict_files, changed_files) = {
+        let repo = discover_repository().context("Failed to discover Git repository")?;
+        let repo_root = repo
+            .workdir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
 
-    let changed_files = if args.staged {
-        get_staged_files()?
-    } else {
-        get_unstaged_files()?
+        let extractor = GitDiffExtractor::new(&repo);
+        let is_conflict = extractor.has_conflicts().unwrap_or(false);
+
+        if is_conflict {
+            let conflict_files = extractor.get_conflict_changes()?;
+            (repo_root, true, conflict_files, Vec::new())
+        } else {
+            let changed = if args.staged {
+                get_staged_files()?
+            } else {
+                get_unstaged_files()?
+            };
+            (repo_root, false, Vec::new(), changed)
+        }
     };
 
-    if changed_files.is_empty() {
-        if args.is_json() {
-            let report = VibeDiffJsonReport::new(
-                repo_root,
-                mode,
-                0,
-                &[],
-                None,
-                start_time.elapsed().as_millis() as u64,
+    let (mode, structural_diffs, system_prompt, files_evaluated) = if is_conflict {
+        if !args.is_json() {
+            eprintln!(
+                "{}",
+                "Git merge/rebase conflict detected: running 3-way architectural reconciliation..."
+                    .yellow()
+                    .bold()
             );
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        } else if args.staged {
-            println!("No modifications detected in staged index.");
-        } else {
-            println!("No modifications detected in working directory.");
         }
-        return Ok(());
-    }
-
-    let mut structural_diffs = Vec::new();
-    for file in &changed_files {
-        if let Ok(diff) = extract_structural_diff(file) {
+        let mut diffs = Vec::new();
+        for file in &conflict_files {
+            let diff = diff_conflict_file(file);
             if !diff.hunks.is_empty() {
-                structural_diffs.push(diff);
+                diffs.push(diff);
             }
         }
-    }
+        ("conflicts", diffs, CONFLICT_SYSTEM_PROMPT, conflict_files.len())
+    } else {
+        let mode_str = if args.staged { "staged" } else { "unstaged" };
+        let mut diffs = Vec::new();
+        for file in &changed_files {
+            if let Ok(diff) = extract_structural_diff(file) {
+                if !diff.hunks.is_empty() {
+                    diffs.push(diff);
+                }
+            }
+        }
+        (mode_str, diffs, SYSTEM_PROMPT, changed_files.len())
+    };
 
     if structural_diffs.is_empty() {
         if args.is_json() {
             let report = VibeDiffJsonReport::new(
                 repo_root,
                 mode,
-                changed_files.len(),
+                files_evaluated,
                 &[],
                 None,
                 start_time.elapsed().as_millis() as u64,
             );
             println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if is_conflict {
+            println!("{}", "No contested structural AST conflicts detected.".dimmed());
+        } else if args.staged {
+            println!("No modifications detected in staged index.");
         } else {
-            println!("{}", "No structural AST changes detected.".dimmed());
+            println!("No modifications detected in working directory.");
         }
         return Ok(());
     }
@@ -176,7 +193,7 @@ pub async fn execute_pipeline(args: &Cli, cancel_token: CancellationToken) -> Re
         let mut chunk_streamed = String::new();
 
         let result = client
-            .analyze_stream_cancellable(&chunk_payload, cancel_token.clone(), |part| {
+            .analyze_stream_cancellable_with_system(&chunk_payload, system_prompt, cancel_token.clone(), |part| {
                 if !args.is_json() {
                     print!("{}", part);
                     let _ = stdout.flush();
@@ -221,7 +238,7 @@ pub async fn execute_pipeline(args: &Cli, cancel_token: CancellationToken) -> Re
         let report = VibeDiffJsonReport::new(
             repo_root,
             mode,
-            changed_files.len(),
+            files_evaluated,
             &structural_diffs,
             Some(merged_analysis),
             start_time.elapsed().as_millis() as u64,

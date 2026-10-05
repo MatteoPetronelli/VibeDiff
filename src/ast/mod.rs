@@ -1,4 +1,4 @@
-use crate::git::{ChangedFile, SupportedLanguage};
+use crate::git::{ChangedFile, ConflictFile, SupportedLanguage};
 use ahash::AHashMap;
 use anyhow::{anyhow, Context, Result};
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -10,6 +10,7 @@ pub enum AstChangeKind {
     Added,
     Deleted,
     ContractBroken,
+    ConflictContested,
 }
 
 impl AstChangeKind {
@@ -19,6 +20,7 @@ impl AstChangeKind {
             Self::Added => "ADDED",
             Self::Deleted => "DELETED",
             Self::ContractBroken => "CONTRACT_BROKEN",
+            Self::ConflictContested => "CONFLICT_CONTESTED",
         }
     }
 }
@@ -81,19 +83,36 @@ impl StructuralDiff {
             return payload;
         }
         for hunk in &self.hunks {
-            payload.push_str(&format!(
-                "--- SYMBOL: {} [{}] ---\n",
-                hunk.symbol_name, hunk.kind
-            ));
-            if let Some(old) = &hunk.old_node {
-                payload.push_str("<<< OLD\n");
-                payload.push_str(old.trim());
-                payload.push('\n');
-            }
-            if let Some(new) = &hunk.new_node {
-                payload.push_str(">>> NEW\n");
-                payload.push_str(new.trim());
-                payload.push('\n');
+            if hunk.kind == AstChangeKind::ConflictContested {
+                payload.push_str(&format!(
+                    "[CONFLICT_CONTESTED] Symbol: {}\n",
+                    hunk.symbol_name
+                ));
+                if let Some(ours) = &hunk.old_node {
+                    payload.push_str("--- OURS (Current Branch):\n");
+                    payload.push_str(ours.trim());
+                    payload.push('\n');
+                }
+                if let Some(theirs) = &hunk.new_node {
+                    payload.push_str("--- THEIRS (Incoming Branch):\n");
+                    payload.push_str(theirs.trim());
+                    payload.push('\n');
+                }
+            } else {
+                payload.push_str(&format!(
+                    "--- SYMBOL: {} [{}] ---\n",
+                    hunk.symbol_name, hunk.kind
+                ));
+                if let Some(old) = &hunk.old_node {
+                    payload.push_str("<<< OLD\n");
+                    payload.push_str(old.trim());
+                    payload.push('\n');
+                }
+                if let Some(new) = &hunk.new_node {
+                    payload.push_str(">>> NEW\n");
+                    payload.push_str(new.trim());
+                    payload.push('\n');
+                }
             }
         }
         payload
@@ -745,6 +764,206 @@ pub fn diff_files(files: &[ChangedFile]) -> Result<Vec<StructuralDiff>> {
         diffs.push(diff_changed_file(file)?);
     }
     Ok(diffs)
+}
+
+pub fn diff_conflict_file(file: &ConflictFile) -> StructuralDiff {
+    let (parsed_ours, parsed_theirs) = if file.ours.is_none() && file.theirs.is_none() {
+        crate::git::split_conflict_markers(&file.working_copy).unzip()
+    } else {
+        (None, None)
+    };
+
+    let ours_str = file.ours.as_deref().or(parsed_ours.as_deref());
+    let theirs_str = file.theirs.as_deref().or(parsed_theirs.as_deref());
+    let ancestor_str = file.ancestor.as_deref();
+
+    let hasher_state = ahash::RandomState::with_seeds(0x243f, 0x6a88, 0x85a3, 0x08d3);
+
+    let mut ancestor_nodes = Vec::new();
+    if let Some(src) = ancestor_str {
+        let mut parser = tree_sitter::Parser::new();
+        if let Some(lang) = get_language(file.language) {
+            if parser.set_language(&lang).is_ok() {
+                if let Some(tree) = parser.parse(src.as_bytes(), None) {
+                    extract_nodes(tree.root_node(), src.as_bytes(), &mut ancestor_nodes, &hasher_state);
+                }
+            }
+        }
+    }
+
+    let mut ours_nodes = Vec::new();
+    if let Some(src) = ours_str {
+        let mut parser = tree_sitter::Parser::new();
+        if let Some(lang) = get_language(file.language) {
+            if parser.set_language(&lang).is_ok() {
+                if let Some(tree) = parser.parse(src.as_bytes(), None) {
+                    extract_nodes(tree.root_node(), src.as_bytes(), &mut ours_nodes, &hasher_state);
+                }
+            }
+        }
+    }
+
+    let mut theirs_nodes = Vec::new();
+    if let Some(src) = theirs_str {
+        let mut parser = tree_sitter::Parser::new();
+        if let Some(lang) = get_language(file.language) {
+            if parser.set_language(&lang).is_ok() {
+                if let Some(tree) = parser.parse(src.as_bytes(), None) {
+                    extract_nodes(tree.root_node(), src.as_bytes(), &mut theirs_nodes, &hasher_state);
+                }
+            }
+        }
+    }
+
+    let mut ancestor_map: AHashMap<String, Vec<ExtractedNode>> = AHashMap::new();
+    for node in ancestor_nodes {
+        ancestor_map.entry(node.symbol_name.clone()).or_default().push(node);
+    }
+
+    let mut theirs_map: AHashMap<String, Vec<ExtractedNode>> = AHashMap::new();
+    for node in theirs_nodes {
+        theirs_map.entry(node.symbol_name.clone()).or_default().push(node);
+    }
+
+    let mut hunks = Vec::new();
+
+    for our_node in ours_nodes {
+        if let Some(their_candidates) = theirs_map.get_mut(&our_node.symbol_name) {
+            let mut exact_idx = None;
+            for (idx, th) in their_candidates.iter().enumerate() {
+                if th.sig_hash == our_node.sig_hash && th.body_hash == our_node.body_hash {
+                    exact_idx = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = exact_idx {
+                their_candidates.remove(idx);
+                if let Some(anc_candidates) = ancestor_map.get_mut(&our_node.symbol_name) {
+                    if !anc_candidates.is_empty() {
+                        anc_candidates.remove(0);
+                    }
+                }
+                continue;
+            }
+
+            let their_node = their_candidates.remove(0);
+            let anc_opt = ancestor_map.get_mut(&our_node.symbol_name).and_then(|c| {
+                if !c.is_empty() {
+                    Some(c.remove(0))
+                } else {
+                    None
+                }
+            });
+
+            match anc_opt {
+                Some(anc) => {
+                    let our_changed = anc.sig_hash != our_node.sig_hash || anc.body_hash != our_node.body_hash;
+                    let their_changed = anc.sig_hash != their_node.sig_hash || anc.body_hash != their_node.body_hash;
+
+                    if our_changed && their_changed {
+                        hunks.push(AstHunk::new(
+                            &our_node.symbol_name,
+                            AstChangeKind::ConflictContested,
+                            Some(our_node.clean_text),
+                            Some(their_node.clean_text),
+                        ));
+                    } else if their_changed {
+                        let kind = if anc.sig_hash != their_node.sig_hash {
+                            AstChangeKind::ContractBroken
+                        } else {
+                            AstChangeKind::Modified
+                        };
+                        hunks.push(AstHunk::new(
+                            &our_node.symbol_name,
+                            kind,
+                            Some(anc.clean_text),
+                            Some(their_node.clean_text),
+                        ));
+                    } else if our_changed {
+                        let kind = if anc.sig_hash != our_node.sig_hash {
+                            AstChangeKind::ContractBroken
+                        } else {
+                            AstChangeKind::Modified
+                        };
+                        hunks.push(AstHunk::new(
+                            &our_node.symbol_name,
+                            kind,
+                            Some(anc.clean_text),
+                            Some(our_node.clean_text),
+                        ));
+                    }
+                }
+                None => {
+                    hunks.push(AstHunk::new(
+                        &our_node.symbol_name,
+                        AstChangeKind::ConflictContested,
+                        Some(our_node.clean_text),
+                        Some(their_node.clean_text),
+                    ));
+                }
+            }
+        } else {
+            let anc_opt = ancestor_map.get_mut(&our_node.symbol_name).and_then(|c| {
+                if !c.is_empty() {
+                    Some(c.remove(0))
+                } else {
+                    None
+                }
+            });
+
+            match anc_opt {
+                Some(_) => {
+                    hunks.push(AstHunk::new(
+                        &our_node.symbol_name,
+                        AstChangeKind::ConflictContested,
+                        Some(our_node.clean_text),
+                        None,
+                    ));
+                }
+                None => {
+                    hunks.push(AstHunk::new(
+                        &our_node.symbol_name,
+                        AstChangeKind::Added,
+                        None,
+                        Some(our_node.clean_text),
+                    ));
+                }
+            }
+        }
+    }
+
+    for (symbol_name, remaining_theirs) in theirs_map {
+        for their_node in remaining_theirs {
+            let anc_opt = ancestor_map.get_mut(&symbol_name).and_then(|c| {
+                if !c.is_empty() {
+                    Some(c.remove(0))
+                } else {
+                    None
+                }
+            });
+
+            match anc_opt {
+                Some(_) => {
+                    hunks.push(AstHunk::new(
+                        &symbol_name,
+                        AstChangeKind::ConflictContested,
+                        None,
+                        Some(their_node.clean_text),
+                    ));
+                }
+                None => {
+                    hunks.push(AstHunk::new(
+                        &symbol_name,
+                        AstChangeKind::Added,
+                        None,
+                        Some(their_node.clean_text),
+                    ));
+                }
+            }
+        }
+    }
+
+    StructuralDiff::new(file.path.clone(), file.language, hunks)
 }
 
 #[cfg(test)]
