@@ -10,7 +10,7 @@ use vibediff::{
 };
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "vd", about = "VibeDiff: AI-powered architectural diff engine")]
+#[command(name = "vd", version, about = "VibeDiff: AI-powered architectural diff engine")]
 pub struct Cli {
     #[arg(short, long)]
     pub staged: bool,
