@@ -236,6 +236,8 @@ cargo run --bin vd -- --staged --model bench-reason-4b
 | `-m, --model` | CLI Option | Target Ollama model identifier. | `bench-reason-4b` | No |
 | `-e, --endpoint` | CLI Option | HTTP endpoint URL for Ollama daemon. | `http://localhost:11434` | No |
 | `-w, --watch` | CLI Flag | Launch persistent filesystem watcher mode. | `false` | No |
+| `--json` | CLI Flag | Emit machine-readable JSON directly to stdout with diagnostics routed to stderr. | `false` | No |
+| `--format` | CLI Option | Output format: `text` (human streaming) or `json` (agent pipeline). | `text` | No |
 | `OLLAMA_HOST` | Environment Variable | Host address and port bound by the Ollama server. | `127.0.0.1:11434` | No |
 | `OLLAMA_FLASH_ATTENTION` | Environment Variable | Enable Flash Attention in Ollama to minimize VRAM usage. | `false` | No |
 
@@ -287,17 +289,29 @@ Connect to a remote GPU server running an alternative model:
 vd --endpoint http://192.168.1.100:11434 --model deepseek-r1:7b
 ```
 
+#### Scenario 5: Agent Pipe Mode & Machine-Readable Output
+Pipe deterministic JSON telemetry directly into external AI tools (Claude Code, Cursor, Aider) or CI scripts:
+
+```powershell
+# Output structured JSON to stdout (diagnostics sent to stderr)
+vd --json
+
+# Pipe to jq or PowerShell JSON parser
+vd --json | ConvertFrom-Json
+vd --staged --format json | jq '.diffs[] | select(.hunks[].kind == "CONTRACT_BROKEN")'
+```
+
 ---
 
 ## Development, Testing & Verification
 
-VibeDiff includes an automated test suite verifying Git ingestion, Tree-Sitter normalization, and SSE stream parsing.
+VibeDiff includes an automated test suite verifying Git ingestion, Tree-Sitter normalization, SSE stream parsing, and JSON report generation.
 
 ### Verification Targets
 
 | Command | Target / Scope | Success Criteria |
 | :--- | :--- | :--- |
-| `cargo test` | Full test suite (15 unit and integration tests) | `15 passed; 0 failed; 0 ignored` |
+| `cargo test` | Full test suite (18 unit and integration tests) | `18 passed; 0 failed; 0 ignored` |
 | `cargo check` | Type check and dependency resolution | Exits with code `0`, 0 warnings |
 | `cargo build --release --bin vd` | Release binary compilation | Outputs optimized `target/release/vd.exe` |
 

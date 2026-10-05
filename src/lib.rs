@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod client;
 pub mod git;
+pub mod output;
 
 pub use ast::{
     diff_changed_file, diff_files, diff_source, extract_structural_diff, get_language,
@@ -14,4 +15,8 @@ pub use git::{
     discover_repository, discover_repository_at, get_changed_files, get_changed_files_at,
     get_changed_files_from_repo, get_changed_files_selective, get_staged_files,
     get_unstaged_files, is_ignored_lockfile, ChangedFile, SupportedLanguage,
+};
+pub use output::{
+    parse_pillar_sections, AstHunkReport, FileStructuralDiffReport, PillarAnalysisReport,
+    VibeDiffJsonReport,
 };

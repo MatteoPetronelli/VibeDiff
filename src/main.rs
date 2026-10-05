@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::Path;
 use vibediff::{
     discover_repository, extract_structural_diff, get_staged_files, get_unstaged_files,
-    OllamaClient,
+    parse_pillar_sections, OllamaClient, VibeDiffJsonReport,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -23,13 +23,39 @@ pub struct Cli {
 
     #[arg(short, long)]
     pub watch: bool,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+    pub format: String,
+}
+
+impl Cli {
+    pub fn is_json(&self) -> bool {
+        self.json || self.format == "json"
+    }
 }
 
 pub async fn execute_pipeline(args: &Cli) -> Result<()> {
-    let client = OllamaClient::new(Some(args.endpoint.clone()), Some(args.model.clone()));
-    client.check_health().await?;
+    let start_time = std::time::Instant::now();
+    let mode = if args.staged { "staged" } else { "unstaged" };
 
-    let _repo = discover_repository().context("Failed to discover Git repository")?;
+    let client = OllamaClient::new(Some(args.endpoint.clone()), Some(args.model.clone()));
+    if let Err(e) = client.check_health().await {
+        if args.is_json() {
+            eprintln!("Error: {}", e);
+        } else {
+            eprintln!("{}", format!("Error: {}", e).red().bold());
+        }
+        return Err(e);
+    }
+
+    let repo = discover_repository().context("Failed to discover Git repository")?;
+    let repo_root = repo
+        .workdir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
 
     let changed_files = if args.staged {
         get_staged_files()?
@@ -38,7 +64,17 @@ pub async fn execute_pipeline(args: &Cli) -> Result<()> {
     };
 
     if changed_files.is_empty() {
-        if args.staged {
+        if args.is_json() {
+            let report = VibeDiffJsonReport::new(
+                repo_root,
+                mode,
+                0,
+                &[],
+                None,
+                start_time.elapsed().as_millis() as u64,
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if args.staged {
             println!("No modifications detected in staged index.");
         } else {
             println!("No modifications detected in working directory.");
@@ -56,46 +92,92 @@ pub async fn execute_pipeline(args: &Cli) -> Result<()> {
     }
 
     if structural_diffs.is_empty() {
-        println!("No structural AST changes detected.");
+        if args.is_json() {
+            let report = VibeDiffJsonReport::new(
+                repo_root,
+                mode,
+                changed_files.len(),
+                &[],
+                None,
+                start_time.elapsed().as_millis() as u64,
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("{}", "No structural AST changes detected.".dimmed());
+        }
         return Ok(());
     }
 
     let mut full_payload = String::new();
-    println!("{}", "=== VibeDiff Architectural Analysis ===".cyan().bold());
+    if !args.is_json() {
+        println!("{}", "=== VibeDiff Architectural Analysis ===".cyan().bold());
+    }
 
     for diff in &structural_diffs {
-        let kinds: Vec<String> = diff
-            .hunks
-            .iter()
-            .map(|h| format!("{}: {}", h.symbol_name, h.kind))
-            .collect();
-        println!(
-            "{} [{}] -> {}",
-            diff.file_path.display().to_string().green().bold(),
-            diff.language.to_string().magenta(),
-            kinds.join(", ").yellow()
-        );
+        if !args.is_json() {
+            let kinds: Vec<String> = diff
+                .hunks
+                .iter()
+                .map(|h| format!("{}: {}", h.symbol_name, h.kind))
+                .collect();
+            println!(
+                "{} [{}] -> {}",
+                diff.file_path.display().to_string().green().bold(),
+                diff.language.to_string().magenta(),
+                kinds.join(", ").yellow()
+            );
+        }
         full_payload.push_str(&diff.to_llm_payload());
         full_payload.push('\n');
     }
 
-    println!("{}", "----------------------------------------".bright_black());
+    if !args.is_json() {
+        println!("{}", "----------------------------------------".bright_black());
+    }
 
     let mut stdout = std::io::stdout();
+    let mut streamed_response = String::new();
     let result = client
         .analyze_stream(&full_payload, |chunk| {
-            print!("{}", chunk);
-            let _ = stdout.flush();
+            if !args.is_json() {
+                print!("{}", chunk);
+                let _ = stdout.flush();
+            } else {
+                streamed_response.push_str(chunk);
+            }
         })
         .await;
 
     match result {
-        Ok(_) => {
-            println!();
-            println!("{}", "========================================".cyan().bold());
+        Ok(raw_text) => {
+            let final_text = if args.is_json() {
+                streamed_response
+            } else {
+                raw_text
+            };
+            if args.is_json() {
+                let analysis = parse_pillar_sections(&final_text, &args.model);
+                let report = VibeDiffJsonReport::new(
+                    repo_root,
+                    mode,
+                    changed_files.len(),
+                    &structural_diffs,
+                    Some(analysis),
+                    start_time.elapsed().as_millis() as u64,
+                );
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!();
+                println!("{}", "========================================".cyan().bold());
+            }
         }
         Err(e) => {
-            eprintln!("{}", format!("\nInference error: {}", e).red().bold());
+            if args.is_json() {
+                eprintln!("Inference error: {}", e);
+            } else {
+                eprintln!("{}", format!("\nInference error: {}", e).red().bold());
+            }
+            return Err(e);
         }
     }
 
@@ -104,7 +186,11 @@ pub async fn execute_pipeline(args: &Cli) -> Result<()> {
 
 pub async fn run_once(args: &Cli) -> Result<()> {
     if let Err(err) = execute_pipeline(args).await {
-        eprintln!("{}", format!("Error: {}", err).red().bold());
+        if args.is_json() {
+            eprintln!("Error: {}", err);
+        } else {
+            eprintln!("{}", format!("Error: {}", err).red().bold());
+        }
         std::process::exit(1);
     }
     Ok(())
@@ -148,7 +234,9 @@ fn should_process_event(event: &notify::Event) -> bool {
 }
 
 pub async fn run_watch(args: &Cli) -> Result<()> {
-    println!("{}", "Starting VibeDiff in watch mode...".cyan().bold());
+    if !args.is_json() {
+        println!("{}", "Starting VibeDiff in watch mode...".cyan().bold());
+    }
     let _ = execute_pipeline(args).await;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -166,7 +254,9 @@ pub async fn run_watch(args: &Cli) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                println!("{}", "\nWatch mode stopped.".yellow());
+                if !args.is_json() {
+                    println!("{}", "\nWatch mode stopped.".yellow());
+                }
                 break;
             }
             event_opt = rx.recv() => {
@@ -174,7 +264,9 @@ pub async fn run_watch(args: &Cli) -> Result<()> {
                     if should_process_event(&event) {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         while rx.try_recv().is_ok() {}
-                        println!("{}", "\n[Change detected - re-analyzing...]".blue().bold());
+                        if !args.is_json() {
+                            println!("{}", "\n[Change detected - re-analyzing...]".blue().bold());
+                        }
                         let _ = execute_pipeline(args).await;
                     }
                 } else {
@@ -206,8 +298,11 @@ mod tests {
         let args = Cli::parse_from(["vd"]);
         assert!(!args.staged);
         assert!(!args.watch);
+        assert!(!args.json);
+        assert_eq!(args.format, "text");
         assert_eq!(args.model, "bench-reason-4b");
         assert_eq!(args.endpoint, "http:\x2F\x2Flocalhost:11434");
+        assert!(!args.is_json());
     }
 
     #[test]
@@ -216,6 +311,7 @@ mod tests {
             "vd",
             "--staged",
             "--watch",
+            "--json",
             "-m",
             "custom-model",
             "-e",
@@ -223,8 +319,14 @@ mod tests {
         ]);
         assert!(args.staged);
         assert!(args.watch);
+        assert!(args.json);
+        assert!(args.is_json());
         assert_eq!(args.model, "custom-model");
         assert_eq!(args.endpoint, "http:\x2F\x2F127.0.0.1:8080");
+
+        let args_format = Cli::parse_from(["vd", "--format", "json"]);
+        assert_eq!(args_format.format, "json");
+        assert!(args_format.is_json());
     }
 
     #[test]
