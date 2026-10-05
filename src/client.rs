@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub const SYSTEM_PROMPT: &str = "You are an expert systems engineer and software architect analyzing code diffs.\nProduce an architectural analysis strictly adhering to the following 4-Pillar schema:\n\n1. THE DATA JOURNEY: Step-by-step trace of how data enters, mutates, and exits the changed subsystem.\n2. ARCHITECTURAL PATTERN & DESIGN INTENT: Explicit identification of patterns applied (Event Bus, State Machine, ECS, Guard Clause, etc.).\n3. LANGUAGE & FRAMEWORK CAVEATS: Ecosystem hazards (Unity C# GC/hot-paths, Unreal C++ UPROPERTY ownership, Rust borrow bounds, Python GIL).\n4. CRITICAL ANCHORS & UNHANDLED EDGE CASES: Bounds errors, unhandled exceptions, dropped guard clauses, or silent failures.";
 
@@ -170,26 +172,59 @@ impl OllamaClient {
         }
     }
 
-    pub async fn analyze_stream<F>(&self, payload: &str, mut on_chunk: F) -> Result<String>
+    pub async fn analyze_stream<F>(&self, payload: &str, on_chunk: F) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.analyze_stream_cancellable(payload, CancellationToken::new(), on_chunk)
+            .await
+    }
+
+    pub async fn analyze_stream_cancellable<F>(
+        &self,
+        payload: &str,
+        cancel_token: CancellationToken,
+        on_chunk: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        self.analyze_stream_cancellable_with_timeout(
+            payload,
+            cancel_token,
+            Duration::from_secs(15),
+            on_chunk,
+        )
+        .await
+    }
+
+    pub async fn analyze_stream_cancellable_with_timeout<F>(
+        &self,
+        payload: &str,
+        cancel_token: CancellationToken,
+        chunk_timeout: Duration,
+        mut on_chunk: F,
+    ) -> Result<String>
     where
         F: FnMut(&str),
     {
         let url = format!("{}/v1/chat/completions", self.endpoint);
         let request_body = self.build_request(payload);
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Ollama daemon unreachable at {}. Start the service with 'ollama serve' or launch the Ollama application. Error: {}",
-                    self.endpoint,
-                    e
-                )
-            })?;
+        let resp = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                anyhow::bail!("Stream cancelled by newer filesystem modification");
+            }
+            send_res = self.client.post(&url).json(&request_body).send() => {
+                send_res.map_err(|e| {
+                    anyhow!(
+                        "Ollama daemon unreachable at {}. Start the service with 'ollama serve' or launch the Ollama application. Error: {}",
+                        self.endpoint,
+                        e
+                    )
+                })?
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -201,7 +236,27 @@ impl OllamaClient {
         let mut full_text = String::new();
         let mut buffer = String::new();
 
-        while let Some(chunk_res) = stream.next().await {
+        loop {
+            let chunk_opt = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    anyhow::bail!("Stream cancelled by newer filesystem modification");
+                }
+                next_res = tokio::time::timeout(chunk_timeout, stream.next()) => {
+                    match next_res {
+                        Ok(Some(chunk_res)) => Some(chunk_res),
+                        Ok(None) => None,
+                        Err(_) => {
+                            anyhow::bail!("Ollama stream stalled: no token received for 15 seconds. Ensure GPU memory is not deadlocked.");
+                        }
+                    }
+                }
+            };
+
+            let chunk_res = match chunk_opt {
+                Some(res) => res,
+                None => break,
+            };
+
             let chunk = chunk_res.context("Failed to read SSE chunk from Ollama response stream")?;
             let text = std::str::from_utf8(&chunk)
                 .context("SSE chunk received from Ollama is not valid UTF-8")?;
@@ -330,5 +385,90 @@ mod tests {
         assert!(err_msg.contains(
             "Start the service with 'ollama serve' or launch the Ollama application."
         ));
+    }
+
+    #[tokio::test]
+    async fn test_stream_cancellation_preemption() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+                let chunk1 = "33\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"start \"}}]}\n\n\r\n";
+                let _ = socket.write_all(chunk1.as_bytes()).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+
+        let client = OllamaClient::new(Some(format!("http:\x2F\x2F{}", addr)), None);
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+
+        let mut received = Vec::new();
+        let stream_fut = client.analyze_stream_cancellable("test payload", cancel_token, |token| {
+            received.push(token.to_string());
+            cancel_clone.cancel();
+        });
+
+        let result = stream_fut.await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Stream cancelled by newer filesystem modification"));
+        assert_eq!(received, vec!["start "]);
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout_trigger() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let client = OllamaClient::new(Some(format!("http:\x2F\x2F{}", addr)), None);
+        let cancel_token = CancellationToken::new();
+
+        let result = client
+            .analyze_stream_cancellable_with_timeout(
+                "test payload",
+                cancel_token,
+                Duration::from_millis(80),
+                |_| {},
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Ollama stream stalled: no token received for 15 seconds. Ensure GPU memory is not deadlocked."));
+    }
+
+    #[tokio::test]
+    async fn test_watch_preemption_logic() {
+        let parent_token = CancellationToken::new();
+        let child_token = parent_token.child_token();
+
+        assert!(!parent_token.is_cancelled());
+        assert!(!child_token.is_cancelled());
+
+        parent_token.cancel();
+
+        assert!(parent_token.is_cancelled());
+        assert!(child_token.is_cancelled());
+
+        let fresh_token = CancellationToken::new();
+        assert!(!fresh_token.is_cancelled());
     }
 }

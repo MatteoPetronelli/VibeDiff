@@ -4,6 +4,7 @@ use colored::Colorize;
 use notify::Watcher;
 use std::io::Write;
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 use vibediff::{
     discover_repository, extract_structural_diff, get_staged_files, get_unstaged_files,
     parse_pillar_sections, partition_diffs_by_budget, serialize_chunk_payload,
@@ -38,7 +39,7 @@ impl Cli {
     }
 }
 
-pub async fn execute_pipeline(args: &Cli) -> Result<()> {
+pub async fn execute_pipeline(args: &Cli, cancel_token: CancellationToken) -> Result<()> {
     let start_time = std::time::Instant::now();
     let mode = if args.staged { "staged" } else { "unstaged" };
 
@@ -166,12 +167,16 @@ pub async fn execute_pipeline(args: &Cli) -> Result<()> {
             println!("{}", "----------------------------------------".bright_black());
         }
 
+        if cancel_token.is_cancelled() {
+            anyhow::bail!("Stream cancelled by newer filesystem modification");
+        }
+
         let chunk_payload = serialize_chunk_payload(chunk, idx, total_chunks);
         let mut stdout = std::io::stdout();
         let mut chunk_streamed = String::new();
 
         let result = client
-            .analyze_stream(&chunk_payload, |part| {
+            .analyze_stream_cancellable(&chunk_payload, cancel_token.clone(), |part| {
                 if !args.is_json() {
                     print!("{}", part);
                     let _ = stdout.flush();
@@ -197,6 +202,11 @@ pub async fn execute_pipeline(args: &Cli) -> Result<()> {
                 }
             }
             Err(e) => {
+                if cancel_token.is_cancelled()
+                    || e.to_string().contains("Stream cancelled by newer filesystem modification")
+                {
+                    return Err(e);
+                }
                 if args.is_json() {
                     eprintln!("Inference error: {}", e);
                 } else {
@@ -223,7 +233,8 @@ pub async fn execute_pipeline(args: &Cli) -> Result<()> {
 }
 
 pub async fn run_once(args: &Cli) -> Result<()> {
-    if let Err(err) = execute_pipeline(args).await {
+    let cancel_token = CancellationToken::new();
+    if let Err(err) = execute_pipeline(args, cancel_token).await {
         if args.is_json() {
             eprintln!("Error: {}", err);
         } else {
@@ -271,11 +282,37 @@ fn should_process_event(event: &notify::Event) -> bool {
     false
 }
 
+fn spawn_pipeline_task(
+    args: Cli,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let res = execute_pipeline(&args, cancel_token.clone()).await;
+        if let Err(e) = res {
+            if !cancel_token.is_cancelled()
+                && !e
+                    .to_string()
+                    .contains("Stream cancelled by newer filesystem modification")
+            {
+                if args.is_json() {
+                    eprintln!("Error: {}", e);
+                } else {
+                    eprintln!("{}", format!("Error: {}", e).red().bold());
+                }
+            }
+        }
+    })
+}
+
 pub async fn run_watch(args: &Cli) -> Result<()> {
     if !args.is_json() {
         println!("{}", "Starting VibeDiff in watch mode...".cyan().bold());
     }
-    let _ = execute_pipeline(args).await;
+
+    let initial_token = CancellationToken::new();
+    let mut active_token: Option<CancellationToken> = Some(initial_token.clone());
+    let mut active_handle: Option<tokio::task::JoinHandle<()>> =
+        Some(spawn_pipeline_task(args.clone(), initial_token));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
     let mut watcher = notify::RecommendedWatcher::new(
@@ -292,6 +329,12 @@ pub async fn run_watch(args: &Cli) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                if let Some(token) = active_token.take() {
+                    token.cancel();
+                }
+                if let Some(handle) = active_handle.take() {
+                    handle.abort();
+                }
                 if !args.is_json() {
                     println!("{}", "\nWatch mode stopped.".yellow());
                 }
@@ -302,10 +345,35 @@ pub async fn run_watch(args: &Cli) -> Result<()> {
                     if should_process_event(&event) {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         while rx.try_recv().is_ok() {}
+
+                        let is_running = active_handle
+                            .as_ref()
+                            .map(|h| !h.is_finished())
+                            .unwrap_or(false);
+
+                        if is_running {
+                            if let Some(token) = active_token.take() {
+                                token.cancel();
+                            }
+                            if !args.is_json() {
+                                eprintln!(
+                                    "{}",
+                                    "Changes detected: cancelling previous analysis...".yellow()
+                                );
+                            }
+                        }
+                        if let Some(handle) = active_handle.take() {
+                            handle.abort();
+                        }
+
                         if !args.is_json() {
                             println!("{}", "\n[Change detected - re-analyzing...]".blue().bold());
                         }
-                        let _ = execute_pipeline(args).await;
+
+                        let new_token = CancellationToken::new();
+                        let handle = spawn_pipeline_task(args.clone(), new_token.clone());
+                        active_token = Some(new_token);
+                        active_handle = Some(handle);
                     }
                 } else {
                     break;

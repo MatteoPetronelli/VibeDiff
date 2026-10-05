@@ -25,3 +25,4 @@ pub use output::{
     parse_pillar_sections, AstHunkReport, FileStructuralDiffReport, PillarAnalysisReport,
     VibeDiffJsonReport,
 };
+pub use tokio_util::sync::CancellationToken;
